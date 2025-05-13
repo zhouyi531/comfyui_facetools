@@ -101,6 +101,54 @@ class DetectFaces:
                     faces.append(face)
         return (faces,)
 
+class DetectFace:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            'required': {
+                'image': ('IMAGE',),
+                'threshold': ('FLOAT', {'default': 0.5, 'min': 0.0, 'max': 1.0, 'step': 0.01}),
+                'min_size': ('INT', {'default': 64, 'max': 512, 'step': 8}),
+                'max_size': ('INT', {'default': 512, 'min': 512, 'step': 8}),
+            },
+            'optional': {
+                'mask': ('MASK',),
+            }
+        }
+    
+    RETURN_TYPES = ('FACE',)
+    RETURN_NAMES = ('face',)
+    FUNCTION = 'run'
+    CATEGORY = 'facetools'
+
+    def run(self, image, threshold, min_size, max_size, mask=None):
+        # Process image
+        if mask is not None:
+            masked = image * tv.transforms.functional.resize(1-mask, image.shape[1:3])[..., None]
+        else:
+            masked = image
+            
+        # Convert to uint8 once
+        masked = (masked * 255).type(torch.uint8)
+        
+        # Process first image only since we only need one face
+        img = masked[0]
+        
+        # Detect faces
+        unfiltered_faces = detect_faces(img, threshold)
+        
+        # Find first valid face
+        for face in unfiltered_faces:
+            a, b, c, d = face.bbox
+            h = abs(d-b)
+            w = abs(c-a)
+            if (h <= max_size or w <= max_size) and (min_size <= h or min_size <= w):
+                face.image_idx = 0
+                face.img = image[0]
+                return ([face],)
+                
+        return ([],)
+
 class CropFaces:
     @classmethod
     def INPUT_TYPES(cls):
@@ -294,6 +342,7 @@ class JonathandinuMask:
 
 NODE_CLASS_MAPPINGS = {
     'DetectFaces': DetectFaces,
+    'DetectFace': DetectFace,
     'CropFaces': CropFaces,
     'WarpFacesBack': WarpFaceBack,
     'BiSeNetMask': BiSeNetMask,
@@ -305,6 +354,7 @@ NODE_CLASS_MAPPINGS = {
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     'DetectFaces': 'DetectFaces',
+    'DetectFace': 'DetectFace',
     'CropFaces': 'CropFaces',
     'WarpFacesBack': 'Warp Faces Back',
     'BiSeNetMask': 'BiSeNet Mask',
