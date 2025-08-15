@@ -3,14 +3,38 @@ import torch
 import torchvision as tv
 import numpy as np
 import cv2
-import mediapipe as mp
+# import mediapipe as mp  # moved to lazy import inside get_face_mesh()
 from scipy.spatial import ConvexHull
 from folder_paths import models_dir
 from .BiSeNet import BiSeNet
-from ultralytics import YOLO
-from onnxruntime import InferenceSession, get_available_providers
-from transformers import SegformerImageProcessor, SegformerForSemanticSegmentation
-from skimage import transform as trans
+import threading
+import time
+
+# Monkey patch torch.load to handle weights_only issue for ultralytics models
+_original_torch_load = torch.load
+
+def patched_torch_load(*args, **kwargs):
+    try:
+        # Try with default settings first
+        return _original_torch_load(*args, **kwargs)
+    except Exception as e:
+        if "weights_only" in str(e) or "WeightsUnpickler" in str(e):
+            # If it's a weights_only error, retry with weights_only=False
+            kwargs['weights_only'] = False
+            return _original_torch_load(*args, **kwargs)
+        else:
+            raise e
+
+# Apply the monkey patch
+torch.load = patched_torch_load
+
+# Global state to prevent duplicate preloading across imports
+_GLOBAL_PRELOAD_STATE = {
+    'initiated': False,
+    'completed': False,
+    'thread': None,
+    'lock': threading.Lock()
+}
 
 arcface_dst = np.array(
     [[38.2946, 51.6963], [73.5318, 51.5014], [56.0252, 71.7366],
@@ -18,6 +42,7 @@ arcface_dst = np.array(
     dtype=np.float32)
 
 def estimate_norm(lmk, image_size=112,mode='arcface'):
+    from skimage import transform as trans
     assert lmk.shape == (5, 2)
     assert image_size%112==0 or image_size%128==0
     if image_size%112==0:
@@ -51,20 +76,216 @@ def resize(img, size):
     return img, scale_factor, ph, pw
 
 class Models:
+    _init_lock = threading.Lock()
+    _preload_thread = None
+    _preload_complete = False
+    
+    @classmethod
+    def _preload_models(cls):
+        """预加载模型以减少首次使用时的延迟"""
+        global _GLOBAL_PRELOAD_STATE
+        
+        with _GLOBAL_PRELOAD_STATE['lock']:
+            if _GLOBAL_PRELOAD_STATE['completed']:
+                print("Models already preloaded globally, skipping...")
+                cls._preload_complete = True
+                return
+            
+            if _GLOBAL_PRELOAD_STATE['initiated']:
+                print("Another preload is in progress, waiting...")
+                return
+            
+            _GLOBAL_PRELOAD_STATE['initiated'] = True
+        
+        try:
+            print("Starting model preload...")
+            start_time = time.time()
+
+            from ultralytics import YOLO
+            import onnxruntime as ort
+            
+            # 预加载YOLO模型
+            yolo_path = os.path.join(models_dir, 'ultralytics', 'bbox', 'face_yolov8m.pt')
+            if os.path.exists(yolo_path):
+                print("Preloading YOLO model...")
+                cls._yolo = YOLO(yolo_path)
+                
+                # 设置设备
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                cls._yolo = cls._yolo.to(device)
+                
+                # 预热模型
+                dummy_input = torch.zeros((1, 3, 640, 640), device=device)
+                with torch.no_grad():
+                    _ = cls._yolo(dummy_input, verbose=False)
+                
+                print(f"YOLO model preloaded in {time.time() - start_time:.2f}s")
+            else:
+                print(f"YOLO model not found at {yolo_path}")
+            
+            # 预加载landmarks模型
+            lmk_path = os.path.join(models_dir, 'landmarks', 'fan2_68_landmark.onnx')
+            if os.path.exists(lmk_path):
+                print("Preloading landmarks model...")
+                cls._lmk = ort.InferenceSession(lmk_path, providers=ort.get_available_providers())
+                
+                # 预热landmarks模型
+                dummy_crop = np.zeros((1, 3, 256, 256), dtype=np.float32)
+                _ = cls._lmk.run(None, {'input': dummy_crop})
+                
+                print(f"Landmarks model preloaded in {time.time() - start_time:.2f}s")
+            else:
+                print(f"Landmarks model not found at {lmk_path}")
+            
+            cls._preload_complete = True
+            with _GLOBAL_PRELOAD_STATE['lock']:
+                _GLOBAL_PRELOAD_STATE['completed'] = True
+            
+            print(f"All models preloaded in {time.time() - start_time:.2f}s")
+            
+        except Exception as e:
+            print(f"Error during model preload: {e}")
+            cls._preload_complete = False
+            with _GLOBAL_PRELOAD_STATE['lock']:
+                _GLOBAL_PRELOAD_STATE['initiated'] = False
+    
+    @classmethod
+    def start_preload(cls):
+        """在后台启动模型预加载"""
+        global _GLOBAL_PRELOAD_STATE
+        
+        with _GLOBAL_PRELOAD_STATE['lock']:
+            # 如果已经完成或正在进行中，不要启动新的预加载
+            if _GLOBAL_PRELOAD_STATE['completed']:
+                print("Models already preloaded globally, skipping preload start")
+                cls._preload_complete = True
+                return
+            
+            if _GLOBAL_PRELOAD_STATE['initiated'] and _GLOBAL_PRELOAD_STATE['thread'] and _GLOBAL_PRELOAD_STATE['thread'].is_alive():
+                print("Preload already in progress, skipping new preload start")
+                cls._preload_thread = _GLOBAL_PRELOAD_STATE['thread']
+                return
+        
+        if cls._preload_thread is None or not cls._preload_thread.is_alive():
+            cls._preload_thread = threading.Thread(target=cls._preload_models, daemon=True)
+            cls._preload_thread.start()
+            
+            # Update global state
+            with _GLOBAL_PRELOAD_STATE['lock']:
+                _GLOBAL_PRELOAD_STATE['thread'] = cls._preload_thread
+    
     @classmethod
     def yolo(cls, img, threshold):
-        if '_yolo' not in cls.__dict__:
-            cls._yolo = YOLO(os.path.join(models_dir,'ultralytics','bbox','face_yolov8m.pt'))
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            cls._yolo = cls._yolo.to(device)
-        dets = cls._yolo(img, conf=threshold)[0]
+        global _GLOBAL_PRELOAD_STATE
+        
+        with cls._init_lock:
+            if '_yolo' not in cls.__dict__:
+                # 检查全局预加载状态
+                with _GLOBAL_PRELOAD_STATE['lock']:
+                    if _GLOBAL_PRELOAD_STATE['completed']:
+                        print("Using globally preloaded YOLO model")
+                        return cls._yolo_inference(img, threshold)
+                
+                # 如果预加载未完成，等待一段时间
+                if not cls._preload_complete and cls._preload_thread and cls._preload_thread.is_alive():
+                    print("Waiting for model preload to complete...")
+                    cls._preload_thread.join(timeout=30)  # 最多等待30秒
+                
+                if '_yolo' not in cls.__dict__:
+                    from ultralytics import YOLO
+                    print("Loading YOLO model (fallback)...")
+                    start_time = time.time()
+                    cls._yolo = YOLO(os.path.join(models_dir, 'ultralytics', 'bbox', 'face_yolov8m.pt'))
+                    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                    cls._yolo = cls._yolo.to(device)
+                    
+                    # 预热模型
+                    if hasattr(img, 'device'):
+                        dummy_input = torch.zeros((1, 3, 640, 640), device=img.device)
+                    else:
+                        dummy_input = torch.zeros((1, 3, 640, 640))
+                    
+                    with torch.no_grad():
+                        _ = cls._yolo(dummy_input, verbose=False)
+                    
+                    print(f"YOLO model loaded and warmed up in {time.time() - start_time:.2f}s")
+        
+        return cls._yolo_inference(img, threshold)
+    
+    @classmethod
+    def _yolo_inference(cls, img, threshold):
+        """执行YOLO推理的核心逻辑"""
+        try:
+            dets = cls._yolo(img, conf=threshold, verbose=False)[0]
+        except NotImplementedError as e:
+            if "torchvision::nms" in str(e) and "CUDA" in str(e):
+                print("Warning: CUDA NMS not available, falling back to CPU for NMS operations")
+                # Move model to CPU temporarily for inference
+                original_device = next(cls._yolo.model.parameters()).device
+                cls._yolo = cls._yolo.to('cpu')
+                
+                # Move input to CPU as well
+                if isinstance(img, torch.Tensor):
+                    img_cpu = img.cpu()
+                else:
+                    img_cpu = img
+                    
+                dets = cls._yolo(img_cpu, conf=threshold, verbose=False)[0]
+                
+                # Move model back to original device
+                cls._yolo = cls._yolo.to(original_device)
+            else:
+                raise e
+        
         return dets
+    
     @classmethod
     def lmk(cls, crop):
-        if '_lmk' not in cls.__dict__:
-            cls._lmk = InferenceSession(os.path.join(models_dir, 'landmarks', 'fan2_68_landmark.onnx'), providers=get_available_providers())
+        global _GLOBAL_PRELOAD_STATE
+        
+        with cls._init_lock:
+            if '_lmk' not in cls.__dict__:
+                # 检查全局预加载状态
+                with _GLOBAL_PRELOAD_STATE['lock']:
+                    if _GLOBAL_PRELOAD_STATE['completed']:
+                        print("Using globally preloaded landmarks model")
+                        lmk = cls._lmk.run(None, {'input': crop})[0]
+                        return lmk
+                
+                # 如果预加载未完成，等待一段时间
+                if not cls._preload_complete and cls._preload_thread and cls._preload_thread.is_alive():
+                    print("Waiting for landmarks model preload to complete...")
+                    cls._preload_thread.join(timeout=10)  # 最多等待10秒
+                
+                if '_lmk' not in cls.__dict__:
+                    import onnxruntime as ort
+                    print("Loading landmarks model (fallback)...")
+                    start_time = time.time()
+                    cls._lmk = ort.InferenceSession(os.path.join(models_dir, 'landmarks', 'fan2_68_landmark.onnx'), providers=ort.get_available_providers())
+                    
+                    # 预热模型
+                    dummy_crop = np.zeros((1, 3, 256, 256), dtype=np.float32)
+                    _ = cls._lmk.run(None, {'input': dummy_crop})
+                    
+                    print(f"Landmarks model loaded and warmed up in {time.time() - start_time:.2f}s")
+        
         lmk = cls._lmk.run(None, {'input': crop})[0]
         return lmk
+
+# 启动预加载（仅在首次导入时）
+# try:
+#     if not _GLOBAL_PRELOAD_STATE['initiated'] and not _GLOBAL_PRELOAD_STATE['completed']:
+#         print("Starting initial model preload...")
+#         Models.start_preload()
+#     elif _GLOBAL_PRELOAD_STATE['completed']:
+#         print("Models already preloaded globally")
+#         Models._preload_complete = True
+#     else:
+#         print("Model preload in progress...")
+# except Exception as e:
+#     print(f"Error in preload initialization: {e}")
+
+# 注释掉自动预加载，只有在实际使用时才加载模型
 
 def get_submatrix_with_padding(img, a, b, c, d):
     pl = -min(a, 0)
@@ -141,6 +362,7 @@ def detect_faces(img, threshold):
     return faces
 
 def get_face_mesh(crop: torch.Tensor):
+    import mediapipe as mp
     with mp.solutions.face_mesh.FaceMesh(max_num_faces=10) as face_mesh:
         mesh = face_mesh.process(crop.mul(255).type(torch.uint8)[0].numpy())
     _, h, w, _ = crop.shape
@@ -200,14 +422,17 @@ def mask_BiSeNet(crop,
                  hair=False,
                  hat=False,
                  ):
-    with torch.no_grad():
-        bisenet = BiSeNet(n_classes=19)
-        bisenet.cuda()
+    global _bisenet_model, _bisenet_device
+    if '_bisenet_model' not in globals():
+        _bisenet_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        _bisenet_model = BiSeNet(n_classes=19).to(_bisenet_device)
         model_path = os.path.join(models_dir, 'bisenet', '79999_iter.pth')
-        bisenet.load_state_dict(torch.load(model_path))
-        bisenet.eval()
-        crop_t = crop.permute(0,3,1,2).cuda().float()
-        segms_t = bisenet(crop_t)[0].argmax(1).float()
+        _bisenet_model.load_state_dict(torch.load(model_path, map_location=_bisenet_device))
+        _bisenet_model.eval()
+
+    with torch.no_grad():
+        crop_t = crop.permute(0,3,1,2).to(_bisenet_device).float()
+        segms_t = _bisenet_model(crop_t)[0].argmax(1).float()
         
     dic = {
         'skin': 1,
@@ -234,7 +459,7 @@ def mask_BiSeNet(crop,
         if k in dic and v:
             keep.append(dic[k])
 
-    face_part_ids = torch.tensor(keep).cuda()
+    face_part_ids = torch.tensor(keep, device=segms_t.device)
     segms_t = torch.sum(segms_t.repeat(len(face_part_ids), 1,1,1) == face_part_ids[...,None,None,None], axis=0).float()
     mask = segms_t.cpu()
     return mask
@@ -246,15 +471,14 @@ def mask_jonathandinu(crop, skin=True, nose=True, eye_g=True, l_eye=True, r_eye=
  
     device = (
         "cuda"
-        # Device for NVIDIA or AMD GPUs
         if torch.cuda.is_available()
         else "mps"
-        # Device for Apple Silicon (Metal Performance Shaders)
         if torch.backends.mps.is_available()
         else "cpu"
     )
     
     if 'jonathandinu_image_processor' not in globals():
+        from transformers import SegformerImageProcessor, SegformerForSemanticSegmentation
         jonathandinu_image_processor = SegformerImageProcessor.from_pretrained("jonathandinu/face-parsing")
         jonathandinu_model = SegformerForSemanticSegmentation.from_pretrained("jonathandinu/face-parsing")
         jonathandinu_model.to(device)
@@ -293,7 +517,7 @@ def mask_jonathandinu(crop, skin=True, nose=True, eye_g=True, l_eye=True, r_eye=
     for k, v in locals().items():
         if k in ids and v:
             keep.append(ids[k])
-    face_part_ids = torch.tensor(keep).cuda()
+    face_part_ids = torch.tensor(keep, device=labels.device)
 
     mask = torch.sum(labels.repeat(len(face_part_ids), 1,1,1) == face_part_ids[...,None,None,None], axis=0).float().cpu()
 

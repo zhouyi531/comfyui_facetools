@@ -1,7 +1,6 @@
 import torch
 from collections import defaultdict
 from .utils import *
-from transformers import pipeline
 
 class GenderFaceFilter:
     @classmethod
@@ -21,7 +20,12 @@ class GenderFaceFilter:
     def run(self, faces, gender):
         filtered = []
         rest = []
-        pipe = pipeline('image-classification', model='dima806/man_woman_face_image_detection', device=0)
+        # Lazy import and cache the pipeline to avoid repeated heavy initialization
+        if not hasattr(self, '_gender_pipe'):
+            from transformers import pipeline
+            device = 0 if torch.cuda.is_available() else -1
+            self._gender_pipe = pipeline('image-classification', model='dima806/man_woman_face_image_detection', device=device)
+        pipe = self._gender_pipe
         for face in faces:
             _, im = face.crop(224, 1.2)
             im = im.permute(0,3,1,2)[0]
